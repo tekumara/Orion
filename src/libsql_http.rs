@@ -16776,6 +16776,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn router_exposes_operator_json_endpoints() {
         let fixture = RouterFixture::new(LibsqlHttpAuthConfig::default()).await;
+        initialize_system_catalog_for_service(&fixture.state).unwrap();
 
         let (status, body) = fixture.get("/_orion/metrics/raft", None).await;
         assert_eq!(status, StatusCode::OK);
@@ -16819,7 +16820,7 @@ mod tests {
         );
 
         let (status, body) = fixture.get("/_orion/metrics/placement", None).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(body["operations_total"], 0);
         assert_eq!(body["groups_active"], 1);
         assert_eq!(body["groups_unloaded"], 0);
