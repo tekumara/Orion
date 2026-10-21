@@ -743,7 +743,13 @@ async fn send_snapshot_stream_messages(
         for artifact in artifacts {
             let objects = list_slate_db_checkpoint_objects(&object_store, &artifact).await?;
             for object in objects {
-                ensure_checkpoint_object_path_allowed(&artifact, &object.path)?;
+                ensure_checkpoint_object_path_allowed(
+                    &object_store,
+                    &artifact.db_path,
+                    artifact.checkpoint_manifest_id,
+                    &object.path,
+                )
+                .await?;
                 stats.checkpoint_objects += 1;
                 send_snapshot_frame(
                     &tx,
@@ -921,10 +927,6 @@ async fn receive_framed_snapshot_stream(
                             .map_err(|err| Status::invalid_argument(err.to_string()))?,
                     );
                 }
-                ensure_snapshot_object_path_allowed(
-                    allowed_artifacts.as_deref().unwrap_or_default(),
-                    &path,
-                )?;
                 if let Some(previous) = object.take() {
                     if let Err(status) = previous.finish().await {
                         metrics_registry.record_snapshot_transfer(node_id, |metrics| {
@@ -934,6 +936,12 @@ async fn receive_framed_snapshot_stream(
                     }
                     stats.checkpoint_objects += 1;
                 }
+                ensure_snapshot_object_path_allowed(
+                    &target_state.object_store(),
+                    allowed_artifacts.as_deref().unwrap_or_default(),
+                    &path,
+                )
+                .await?;
                 object = Some(ReceivingCheckpointObject::new(&target_state, path, size).await?);
             }
             WireSnapshotFrame::CheckpointObjectChunk(chunk) => {
@@ -979,15 +987,23 @@ async fn receive_framed_snapshot_stream(
     ))
 }
 
-fn ensure_snapshot_object_path_allowed(
+async fn ensure_snapshot_object_path_allowed(
+    object_store: &Arc<dyn ObjectStore>,
     artifacts: &[crate::checkpoint_artifact::SlateDbCheckpointArtifact],
     object_path: &str,
 ) -> Result<(), Status> {
-    if artifacts
-        .iter()
-        .any(|artifact| ensure_checkpoint_object_path_allowed(artifact, object_path).is_ok())
-    {
-        return Ok(());
+    for artifact in artifacts {
+        if ensure_checkpoint_object_path_allowed(
+            object_store,
+            &artifact.db_path,
+            artifact.checkpoint_manifest_id,
+            object_path,
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(());
+        }
     }
     Err(Status::invalid_argument(format!(
         "checkpoint object path {object_path} does not match snapshot artifacts"
@@ -1317,9 +1333,9 @@ mod tests {
     use openraft::network::RaftNetworkFactory;
     use openraft::{BasicNode, Config, Raft, SnapshotPolicy};
     use orion_sqlite::{FileKind, VfsFileOp, VfsSyncBatch, VfsWrite};
-    use slatedb::DbWriteOps;
     use slatedb::object_store::Error as ObjectStoreError;
     use slatedb::object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+    use slatedb::{DbReadOps, DbWriteOps};
     use tempfile::TempDir;
 
     use super::*;
@@ -3385,7 +3401,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn full_snapshot_stream_materializes_checkpoint_objects_across_stores() {
+    async fn full_snapshot_stream_materializes_cloned_checkpoint_objects_across_stores() {
         let source_network = TonicRaftNetwork::new();
         let target_network = TonicRaftNetwork::new();
         let config = test_config().unwrap();
@@ -3394,6 +3410,28 @@ mod tests {
         let target_log_dir = TempDir::new().unwrap();
         let source_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let target_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let ancestor_state =
+            SlateDbStateStore::open("snapshot-xstore-ancestor", Arc::clone(&source_store))
+                .await
+                .unwrap();
+        ancestor_state
+            .db
+            .put(b"inherited-key", b"inherited-value")
+            .await
+            .unwrap();
+        let artifact = crate::checkpoint_artifact::create_slate_db_checkpoint_artifact(
+            &ancestor_state,
+            "snapshot-ancestor",
+        )
+        .await
+        .unwrap();
+        crate::checkpoint_artifact::clone_slate_db_checkpoint_artifact_from_local_objects(
+            &artifact,
+            "snapshot-xstore-source",
+            Arc::clone(&source_store),
+        )
+        .await
+        .unwrap();
         let source_state = SlateDbStateStore::open("snapshot-xstore-source", source_store)
             .await
             .unwrap();
@@ -3496,6 +3534,13 @@ mod tests {
             .with_state_machine(|sm| Box::pin(async move { sm.state_store() }))
             .await
             .unwrap();
+        assert_eq!(
+            DbReadOps::get(installed_target_state.db.as_ref(), b"inherited-key")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&b"inherited-value"[..])
+        );
         let target_cache = TempDir::new().unwrap();
         let target_runtime = OrionSqliteRuntime::new(
             target_raft.clone(),

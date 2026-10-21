@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -97,8 +98,33 @@ pub async fn list_slate_db_checkpoint_objects(
     object_store: &Arc<dyn ObjectStore>,
     artifact: &SlateDbCheckpointArtifact,
 ) -> anyhow::Result<Vec<SlateDbCheckpointObjectRef>> {
-    let manifest = read_checkpoint_manifest(object_store, artifact).await?;
+    let manifest = read_manifest(
+        object_store,
+        &artifact.db_path,
+        Some(artifact.checkpoint_manifest_id),
+    )
+    .await?;
     let mut paths = checkpoint_manifest_required_paths(artifact, &manifest);
+    // A clone's inherited SSTs remain in its ancestors' namespaces. SlateDB also
+    // needs their manifests to pin those SSTs when cloning the exported checkpoint.
+    for external in manifest.external_dbs() {
+        let latest = read_manifest(object_store, &external.path, None).await?;
+        paths.push(manifest_object_path(&external.path, latest.id()));
+        let checkpoint_id = external
+            .final_checkpoint_id
+            .unwrap_or(external.source_checkpoint_id);
+        let checkpoint = latest
+            .checkpoints()
+            .iter()
+            .find(|checkpoint| checkpoint.id == checkpoint_id)
+            .with_context(|| {
+                format!(
+                    "inherited checkpoint {checkpoint_id} missing for {}",
+                    external.path
+                )
+            })?;
+        paths.push(manifest_object_path(&external.path, checkpoint.manifest_id));
+    }
     paths.sort();
     paths.dedup();
 
@@ -113,7 +139,12 @@ pub async fn list_slate_db_checkpoint_objects(
         })
     }))
     .await?;
-    objects.sort_by(|left, right| left.path.cmp(&right.path));
+    // Receivers must persist this manifest before authorizing any ancestor paths.
+    let manifest_path =
+        manifest_object_path(&artifact.object_prefix, artifact.checkpoint_manifest_id).to_string();
+    objects.sort_by(|left, right| {
+        (left.path != manifest_path, &left.path).cmp(&(right.path != manifest_path, &right.path))
+    });
     anyhow::ensure!(
         !objects.is_empty(),
         "checkpoint artifact {} has no referenced objects",
@@ -122,11 +153,42 @@ pub async fn list_slate_db_checkpoint_objects(
     Ok(objects)
 }
 
-pub fn ensure_checkpoint_object_path_allowed(
-    artifact: &SlateDbCheckpointArtifact,
+pub async fn ensure_checkpoint_object_path_allowed(
+    object_store: &Arc<dyn ObjectStore>,
+    db_path: &str,
+    checkpoint_manifest_id: u64,
     object_path: &str,
 ) -> anyhow::Result<()> {
-    ensure_checkpoint_object_path_has_prefix(&artifact.object_prefix, object_path)
+    if ensure_checkpoint_object_path_has_prefix(db_path, object_path).is_ok() {
+        return Ok(());
+    }
+    let manifest = read_manifest(object_store, db_path, Some(checkpoint_manifest_id)).await?;
+    for external in manifest.external_dbs() {
+        if external
+            .sst_ids
+            .iter()
+            .any(|id| sstable_object_path(&external.path, id).as_ref() == object_path)
+        {
+            return Ok(());
+        }
+        // Only metadata from an explicitly referenced ancestor is allowed, not
+        // arbitrary objects under that ancestor's database prefix.
+        if let Some(id) = object_path
+            .strip_prefix(&format!(
+                "{}/manifest/",
+                external.path.trim_end_matches('/')
+            ))
+            .and_then(|name| name.strip_suffix(".manifest"))
+            && id.len() == 20
+            && id.bytes().all(|byte| byte.is_ascii_digit())
+            && id.parse::<u64>().is_ok()
+        {
+            return Ok(());
+        }
+    }
+    anyhow::bail!(
+        "checkpoint object path {object_path} is outside database {db_path} and its checkpoint dependencies"
+    )
 }
 
 pub fn ensure_checkpoint_object_path_has_prefix(
@@ -181,21 +243,17 @@ async fn copy_missing_objects_for_checkpoint(
     Ok(metrics)
 }
 
-async fn read_checkpoint_manifest(
+async fn read_manifest(
     object_store: &Arc<dyn ObjectStore>,
-    artifact: &SlateDbCheckpointArtifact,
+    db_path: &str,
+    manifest_id: Option<u64>,
 ) -> anyhow::Result<VersionedManifest> {
-    AdminBuilder::new(artifact.db_path.clone(), Arc::clone(object_store))
+    AdminBuilder::new(db_path.to_string(), Arc::clone(object_store))
         .build()
-        .read_manifest(Some(artifact.checkpoint_manifest_id))
+        .read_manifest(manifest_id)
         .await
         .map_err(|error| anyhow::anyhow!("{error}"))?
-        .with_context(|| {
-            format!(
-                "checkpoint manifest {} missing for {}",
-                artifact.checkpoint_manifest_id, artifact.checkpoint_id
-            )
-        })
+        .with_context(|| format!("checkpoint manifest {manifest_id:?} missing for {db_path}"))
 }
 
 fn checkpoint_manifest_required_paths(
@@ -207,21 +265,40 @@ fn checkpoint_manifest_required_paths(
         artifact.checkpoint_manifest_id,
     )];
 
+    let external_ssts = manifest
+        .external_dbs()
+        .iter()
+        .flat_map(|external| {
+            external
+                .sst_ids
+                .iter()
+                .map(|id| (*id, external.path.as_str()))
+        })
+        .collect::<HashMap<_, _>>();
+    let table_path = |id: &SsTableId| {
+        sstable_object_path(
+            external_ssts
+                .get(id)
+                .copied()
+                .unwrap_or(&artifact.object_prefix),
+            id,
+        )
+    };
     for view in manifest.l0() {
-        paths.push(sstable_object_path(&artifact.object_prefix, &view.sst.id));
+        paths.push(table_path(&view.sst.id));
     }
     for run in manifest.compacted() {
         for view in &run.sst_views {
-            paths.push(sstable_object_path(&artifact.object_prefix, &view.sst.id));
+            paths.push(table_path(&view.sst.id));
         }
     }
     for segment in manifest.segments() {
         for view in segment.l0() {
-            paths.push(sstable_object_path(&artifact.object_prefix, &view.sst.id));
+            paths.push(table_path(&view.sst.id));
         }
         for run in segment.compacted() {
             for view in &run.sst_views {
-                paths.push(sstable_object_path(&artifact.object_prefix, &view.sst.id));
+                paths.push(table_path(&view.sst.id));
             }
         }
     }

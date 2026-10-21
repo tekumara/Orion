@@ -28,8 +28,9 @@ use orion_raft::{
     OrionSqliteReplicaFreshness, OrionSqliteRuntime, OrionSqliteRuntimeConfig,
     SlateDbCheckpointArtifact, SlateDbStateStore, SqliteDatabaseFileSnapshot,
     SqliteDatabasePageSyncDelta, SqliteDatabasePurgeMetrics, SqliteDatabasePurgePolicy,
-    SqlitePageCompactionPolicy, SqliteStoragePressureMetrics, list_slate_db_checkpoint_objects,
-    purge_tombstoned_sqlite_database, sqlite_storage_pressure,
+    SqlitePageCompactionPolicy, SqliteStoragePressureMetrics,
+    ensure_checkpoint_object_path_allowed as ensure_checkpoint_dependency_path_allowed,
+    list_slate_db_checkpoint_objects, purge_tombstoned_sqlite_database, sqlite_storage_pressure,
 };
 use orion_sqlite::clear_orion_vfs_shared_state;
 use rusqlite::backup::Backup;
@@ -2330,6 +2331,8 @@ struct StandbyCheckpointQuery {
 struct StandbyCheckpointObjectQuery {
     source_group_id: String,
     object_path: String,
+    #[serde(default)]
+    checkpoint_manifest_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -3560,6 +3563,7 @@ async fn export_database_placement_checkpoint_object_endpoint(
         &database,
         &query.source_group_id,
         &query.object_path,
+        query.checkpoint_manifest_id,
     )
     .await
     {
@@ -5225,6 +5229,7 @@ async fn export_database_placement_checkpoint_object(
     database: &str,
     source_group_id: &str,
     object_path: &str,
+    checkpoint_manifest_id: Option<u64>,
 ) -> anyhow::Result<axum::response::Response> {
     validate_database_name(database)?;
     validate_replication_group_id(source_group_id)?;
@@ -5244,7 +5249,13 @@ async fn export_database_placement_checkpoint_object(
             format!("source replication group {source_group_id} is not loaded by this node")
         })?;
     let prefix = source_runtime.state_store().sqlite_database_path(database);
-    ensure_checkpoint_object_path_allowed(&prefix, object_path)?;
+    let object_store = source_runtime.state_store().object_store();
+    if let Some(manifest_id) = checkpoint_manifest_id {
+        ensure_checkpoint_dependency_path_allowed(&object_store, &prefix, manifest_id, object_path)
+            .await?;
+    } else {
+        ensure_checkpoint_object_path_allowed(&prefix, object_path)?;
+    }
     let object_location = ObjectPath::parse(object_path)
         .with_context(|| format!("parsing checkpoint object path {object_path}"))?;
     let bytes = source_runtime
@@ -5995,7 +6006,13 @@ async fn fetch_missing_checkpoint_objects_from_peer(
     for object in &checkpoint.objects {
         stats.objects_seen = stats.objects_seen.saturating_add(1);
         stats.bytes_seen = stats.bytes_seen.saturating_add(object.size);
-        ensure_checkpoint_object_path_allowed(&checkpoint.artifact.object_prefix, &object.path)?;
+        ensure_checkpoint_dependency_path_allowed(
+            &target_store,
+            &checkpoint.artifact.db_path,
+            checkpoint.artifact.checkpoint_manifest_id,
+            &object.path,
+        )
+        .await?;
         let location = ObjectPath::parse(&object.path)
             .with_context(|| format!("parsing checkpoint object path {}", object.path))?;
         if target_object_matches(target_store.as_ref(), &location, object.size).await? {
@@ -6010,6 +6027,7 @@ async fn fetch_missing_checkpoint_objects_from_peer(
             source_group_id,
             &object.path,
             object.size,
+            checkpoint.artifact.checkpoint_manifest_id,
             Arc::clone(&target_store),
             &location,
         )
@@ -6047,6 +6065,7 @@ async fn fetch_checkpoint_object_from_peer_into_store(
     source_group_id: &str,
     object_path: &str,
     expected_size: u64,
+    checkpoint_manifest_id: u64,
     target_store: Arc<dyn ObjectStore>,
     target_location: &ObjectPath,
 ) -> anyhow::Result<u64> {
@@ -6055,10 +6074,14 @@ async fn fetch_checkpoint_object_from_peer_into_store(
         source_endpoint.trim_end_matches('/'),
         database,
     );
-    let mut builder = state.http_client.get(url).query(&[
-        ("source_group_id", source_group_id),
-        ("object_path", object_path),
-    ]);
+    let mut builder = state
+        .http_client
+        .get(url)
+        .query(&[
+            ("source_group_id", source_group_id),
+            ("object_path", object_path),
+        ])
+        .query(&[("checkpoint_manifest_id", checkpoint_manifest_id)]);
     if let Some(auth) = headers.get(axum::http::header::AUTHORIZATION)
         && let Ok(auth) = auth.to_str()
     {
@@ -17697,17 +17720,18 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn placement_standby_refresh_can_materialize_checkpoint_from_source_peer() {
+    async fn placement_standby_refresh_can_materialize_checkpoint_from_moved_source_peer() {
         let fixture = RouterFixture::new(LibsqlHttpAuthConfig::default()).await;
         let default_runtime = fixture.state.replication_groups.default_runtime().unwrap();
         let source_registry = ReplicationGroupRegistry::empty();
         source_registry
             .register_for_test(DEFAULT_REPLICATION_GROUP_ID, default_runtime.clone())
             .unwrap();
-        // Keep the setup move on the source runtime; only the standby target needs
-        // an independent object store for this peer-transfer test.
+        let (source_runtime, _source_log_dir, _source_cache_dir) =
+            isolated_test_runtime_with_store("remote-standby-source", default_runtime.clone())
+                .await;
         source_registry
-            .register_for_test("rg_remote_standby_source", default_runtime.clone())
+            .register_for_test("rg_remote_standby_source", source_runtime)
             .unwrap();
         let target_registry = ReplicationGroupRegistry::empty();
         target_registry
@@ -17886,6 +17910,39 @@ mod tests {
             "{checkpoint:?}"
         );
 
+        let ancestor_runtime = fixture.state.replication_groups.default_runtime().unwrap();
+        let ancestor_store = ancestor_runtime.state_store().object_store();
+        let ancestor_prefix = ancestor_runtime
+            .state_store()
+            .sqlite_database_path("remote_standby_db");
+        let other_tenant_prefix = ancestor_runtime
+            .state_store()
+            .sqlite_database_path("other_tenant");
+        // These objects exist, but neither belongs to this checkpoint. In
+        // particular, referencing an ancestor must not expose its whole prefix.
+        for object_path in [
+            format!("{ancestor_prefix}/compacted/00000000000000000000000000.sst"),
+            format!("{other_tenant_prefix}/compacted/00000000000000000000000000.sst"),
+        ] {
+            ancestor_store
+                .put(
+                    &ObjectPath::from(object_path.clone()),
+                    Bytes::from_static(b"not part of this checkpoint").into(),
+                )
+                .await
+                .unwrap();
+            let path = format!(
+                "/_orion/internal/databases/remote_standby_db/placement/checkpoint/object?source_group_id=rg_remote_standby_source&checkpoint_manifest_id={}&object_path={object_path}",
+                checkpoint["artifact"]["checkpoint_manifest_id"]
+                    .as_u64()
+                    .unwrap()
+            );
+            let (status, _, body) = source_fixture.get_bytes(&path, None).await;
+            let body = String::from_utf8(body).unwrap();
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.contains("outside database"), "{body}");
+        }
+
         let target_fixture = RouterFixture {
             router: target_router,
             state: target_state.clone(),
@@ -18042,6 +18099,14 @@ mod tests {
             .query_row("select value from items where id = 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(copied_value, "remote-delta");
+        drop(conn);
+        let (status, checkpoint) = target_fixture
+            .get(
+                "/_orion/internal/databases/remote_standby_db/placement/checkpoint?source_group_id=rg_remote_standby_target",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{checkpoint:?}");
         source_server.abort();
         let _ = source_server.await;
     }
