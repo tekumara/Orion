@@ -18066,16 +18066,6 @@ mod tests {
         let fixture = RouterFixture::new(LibsqlHttpAuthConfig::default()).await;
         let (target_runtime, _target_log_dir, _target_cache_dir) =
             isolated_test_runtime("checkpoint-size-mismatch-target").await;
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let source_addr = listener.local_addr().unwrap();
-        let source_server = tokio::spawn(async move {
-            let app = Router::new().route(
-                "/_orion/internal/databases/mismatch_db/placement/checkpoint/object",
-                get(|| async { (StatusCode::OK, Body::from(Bytes::from_static(b"short"))) }),
-            );
-            axum::serve(listener, app).await.unwrap();
-        });
-
         let object_path =
             "node/state__sqlite/databases/mismatch_db/state/manifest/00000000000000000001";
         let object_location = ObjectPath::parse(object_path).unwrap();
@@ -18097,35 +18087,56 @@ mod tests {
             }],
         };
 
-        let error = fetch_missing_checkpoint_objects_from_peer(
-            &fixture.state,
-            &HeaderMap::new(),
-            &format!("http://{source_addr}"),
-            "mismatch_db",
-            "rg_source",
-            &target_runtime,
-            &checkpoint,
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("checkpoint object node/state__sqlite/databases/mismatch_db/state/manifest/00000000000000000001 byte count mismatch: received 5, expected 99"),
-            "{error:?}"
-        );
-        assert!(
-            !target_object_matches(
-                target_runtime.state_store().object_store().as_ref(),
-                &object_location,
-                99,
+        for (streamed, expected_error) in [
+            (
+                false,
+                "content length mismatch: source reported 5, expected 99",
+            ),
+            (true, "byte count mismatch: received 5, expected 99"),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let source_addr = listener.local_addr().unwrap();
+            let source_server = tokio::spawn(async move {
+                let app = Router::new().route(
+                    "/_orion/internal/databases/mismatch_db/placement/checkpoint/object",
+                    get(move || async move {
+                        let body = if streamed {
+                            Body::from_stream(futures_util::stream::once(async {
+                                Ok::<_, std::convert::Infallible>(Bytes::from_static(b"short"))
+                            }))
+                        } else {
+                            Body::from(Bytes::from_static(b"short"))
+                        };
+                        (StatusCode::OK, body)
+                    }),
+                );
+                axum::serve(listener, app).await.unwrap();
+            });
+
+            let error = fetch_missing_checkpoint_objects_from_peer(
+                &fixture.state,
+                &HeaderMap::new(),
+                &format!("http://{source_addr}"),
+                "mismatch_db",
+                "rg_source",
+                &target_runtime,
+                &checkpoint,
             )
             .await
-            .unwrap()
-        );
+            .unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error:?}");
+            assert!(matches!(
+                target_runtime
+                    .state_store()
+                    .object_store()
+                    .head(&object_location)
+                    .await,
+                Err(slatedb::object_store::Error::NotFound { .. })
+            ));
 
-        source_server.abort();
-        let _ = source_server.await;
+            source_server.abort();
+            let _ = source_server.await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
