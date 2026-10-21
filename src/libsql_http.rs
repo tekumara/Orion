@@ -17704,10 +17704,10 @@ mod tests {
         source_registry
             .register_for_test(DEFAULT_REPLICATION_GROUP_ID, default_runtime.clone())
             .unwrap();
-        let (source_runtime, _source_log_dir, _source_cache_dir) =
-            isolated_test_runtime("remote-standby-source").await;
+        // Keep the setup move on the source runtime; only the standby target needs
+        // an independent object store for this peer-transfer test.
         source_registry
-            .register_for_test("rg_remote_standby_source", source_runtime)
+            .register_for_test("rg_remote_standby_source", default_runtime.clone())
             .unwrap();
         let target_registry = ReplicationGroupRegistry::empty();
         target_registry
